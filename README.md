@@ -138,8 +138,11 @@ All numbers below were **actually measured** on this host with `--release`; none
 | **Real weights** Depth Anything V2 Small int8 ONNX, CPU | `bench --frames 200 --warmup 20 --real-model` | 200 | 14.909 ms | 18.562 ms | 19.896 ms | 59.6 FPS | 100.00% | 79.1 MiB |
 | **Real VLM, production SLA** SmolVLM2 Q4_K_M via llama-server | `sim --frames 12 --real-vlm` (1500 ms SLA) | 12 | 0.049 ms | 0.147 ms | 0.147 ms | interval-limited | 75.00% | 20.2 MiB |
 | **Real VLM, relaxed SLA** same endpoint, 8000 ms timeout | `sim --frames 12 --real-vlm --timeout-ms 8000` | 12 | 0.061 ms | 0.189 ms | 0.189 ms | interval-limited | 75.00% | 20.1 MiB |
+| **End-to-end real weights** ONNX depth + HTTP SmolVLM2 | `sim --frames 10 --real-model --real-vlm --timeout-ms 8000` | 10 | 40.696 ms | 62.092 ms | 62.092 ms | interval-limited | 100.00% | 90.7 MiB |
 
 Full-stack simulation also measured **1.00 ms** from intrusion frame to latched `HaltCell` publication (budget: <50 ms), wrote **90** audit entries, chain verification passed, and replay produced **0 mismatches** (88 approved, 2 vetoed). The simulated paths use the deterministic depth estimator and a mock VLM; they do **not** imply real-model accuracy.
+
+In the end-to-end real-weight run, calibrated real depth saw no anomaly in the synthetic scene tags, so System 2 was correctly bypassed on 100% of frames; System 1 latency was higher than the isolated ONNX bench because `llama-server` was competing for the same two CPU cores. The ledger verified and replayed with 0 mismatches (10 approved).
 
 At the **1500 ms production SLA** the real 256M VLM could not answer in time on this CPU: both escalations timed out and were replaced by the deterministic safe fallback (0 accepted / 2 fallbacks) while System 1 continued at ~0.05 ms. With the timeout relaxed to 8000 ms, both responses were accepted with measured VLM latencies of **2385 ms** and **2568 ms** (2 accepted / 0 fallbacks), and the resulting ledger still verified and replayed with 0 mismatches. This is the intended behaviour: semantic recovery is best-effort, the safety envelope is not.
 
