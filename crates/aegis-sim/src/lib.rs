@@ -108,6 +108,8 @@ pub struct RuntimeReport {
     pub frames: u64,
     pub spatial_states: u64,
     pub vlm_results: u64,
+    pub vlm_accepted: u64,
+    pub vlm_fallbacks: u64,
     pub bypassed: u64,
     pub vetoes: u64,
     pub clamps: u64,
@@ -372,7 +374,10 @@ pub async fn run<B: VlmBackend + Send + 'static>(
         handle.abort();
     }
     let summary = pipeline.stats().summary();
+    let counters = stats.snapshot();
     report.frames = frames;
+    report.vlm_accepted = counters.accepted;
+    report.vlm_fallbacks = counters.fallbacks;
     report.drops = pipeline.drops();
     report.p50_ms = summary.p50_ms;
     report.p95_ms = summary.p95_ms;

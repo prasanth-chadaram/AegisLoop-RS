@@ -42,8 +42,11 @@ pub struct ZoneSpec {
 pub struct SpatialConfig {
     pub depth_width: u32,
     pub depth_height: u32,
-    /// Converts normalized depth to millimetres.
-    pub depth_scale_mm: f32,
+    /// Linear depth calibration: `mm = depth_offset_mm + d * depth_gain_mm`.
+    /// Synthetic estimator uses offset 0 and gain 2000; real relative-depth
+    /// models need a per-camera offset/gain (see README).
+    pub depth_offset_mm: f32,
+    pub depth_gain_mm: f32,
     pub critical_mm: f32,
     pub zones: Vec<ZoneSpec>,
     /// Enable deterministic scene hints (simulator only). Real models set this
@@ -56,7 +59,8 @@ impl Default for SpatialConfig {
         Self {
             depth_width: 64,
             depth_height: 64,
-            depth_scale_mm: 2000.0,
+            depth_offset_mm: 0.0,
+            depth_gain_mm: 2000.0,
             critical_mm: 120.0,
             zones: vec![
                 ZoneSpec { zone: ZoneId::Near, x0: 0.10, y0: 0.05, x1: 0.90, y1: 0.35 },
@@ -75,7 +79,10 @@ impl SpatialConfig {
                 "depth dimensions must be non-zero".to_owned(),
             ));
         }
-        if !self.depth_scale_mm.is_finite() || !self.critical_mm.is_finite() {
+        if !self.depth_offset_mm.is_finite()
+            || !self.depth_gain_mm.is_finite()
+            || !self.critical_mm.is_finite()
+        {
             return Err(PerceptionError::InvalidFrame(
                 "depth scale / critical threshold must be finite".to_owned(),
             ));
@@ -227,7 +234,7 @@ pub fn compute_spatial(
                 if !d.is_finite() {
                     continue;
                 }
-                let mm = d * cfg.depth_scale_mm;
+                let mm = cfg.depth_offset_mm + d * cfg.depth_gain_mm;
                 if mm < min {
                     min = mm;
                 }

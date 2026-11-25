@@ -10,7 +10,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::warn;
 
@@ -195,6 +195,29 @@ impl HttpVlmBackend {
     }
 }
 
+/// Constrained decoding schema sent to llama-server. The response is still
+/// re-validated client-side; the grammar only reduces malformed outputs.
+static VLM_JSON_SCHEMA: std::sync::LazyLock<serde_json::Value> = std::sync::LazyLock::new(|| {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["action", "confidence"],
+        "properties": {
+            "action": {
+                "oneOf": [
+                    {"type": "object", "additionalProperties": false, "required": ["type"], "properties": {"type": {"const": "continue"}}},
+                    {"type": "object", "additionalProperties": false, "required": ["type", "speed_pct"], "properties": {"type": {"const": "slow_conveyor"}, "speed_pct": {"type": "integer", "minimum": 0, "maximum": 100}}},
+                    {"type": "object", "additionalProperties": false, "required": ["type", "bin_id"], "properties": {"type": {"const": "divert_part"}, "bin_id": {"type": "integer", "minimum": 1, "maximum": 8}}},
+                    {"type": "object", "additionalProperties": false, "required": ["type", "dx_mm", "dy_mm", "dz_mm"], "properties": {"type": {"const": "regrasp_offset"}, "dx_mm": {"type": "number"}, "dy_mm": {"type": "number"}, "dz_mm": {"type": "number"}}},
+                    {"type": "object", "additionalProperties": false, "required": ["type", "reason"], "properties": {"type": {"const": "halt_cell"}, "reason": {"type": "string"}}}
+                ]
+            },
+            "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+            "rationale": {"type": "string"}
+        }
+    })
+});
+
 #[derive(Debug, Deserialize)]
 struct ChatResponse {
     choices: Vec<Choice>,
@@ -216,13 +239,15 @@ impl VlmBackend for HttpVlmBackend {
         request: &'a VlmRequest,
     ) -> Pin<Box<dyn Future<Output = Result<VlmResponse, VlmError>> + Send + 'a>> {
         Box::pin(async move {
+            let spatial = &request.spatial;
             let prompt = format!(
-                "You are the safety-aware semantic planner of a robotics cell. \
-                 Inspect the spatial state and propose exactly one action as JSON. \
-                 Schema: {{\"action\":{{\"type\":\"continue\"|\"slow_conveyor\"|\"divert_part\"|\"regrasp_offset\"|\"halt_cell\", ...}},\"confidence\":0..1,\"rationale\":\"...\"}}. \
-                 Spatial state: {}",
-                serde_json::to_string(&request.spatial)
-                    .map_err(|e| VlmError::Malformed(e.to_string()))?
+                "Spatial: min_clearance_mm={:.1}, human={}, obstacle={}, anomaly={:.2}. \
+                 Propose one safe action as strict JSON only: \
+                 {{\"action\":{{\"type\":\"continue\"|\"slow_conveyor\"|\"divert_part\"|\"regrasp_offset\"|\"halt_cell\", ...}},\"confidence\":0..1,\"rationale\":\"...\"}}",
+                spatial.min_clearance_mm(),
+                spatial.human_intrusion,
+                spatial.obstacle_intrusion,
+                spatial.anomaly_score
             );
             let mut user_content = serde_json::json!([
                 {"type": "text", "text": prompt}
@@ -254,8 +279,15 @@ impl VlmBackend for HttpVlmBackend {
             let body = serde_json::json!({
                 "model": self.config.model,
                 "temperature": 0.0,
-                "max_tokens": 192,
-                "response_format": {"type": "json_object"},
+                "max_tokens": 96,
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "aegis_vlm_intent",
+                        "strict": true,
+                        "schema": VLM_JSON_SCHEMA.clone()
+                    }
+                },
                 "messages": [
                     {"role": "system", "content": "Output strict JSON only. No markdown."},
                     {"role": "user", "content": user_content}
@@ -279,9 +311,21 @@ impl VlmBackend for HttpVlmBackend {
                 .first()
                 .map(|c| c.message.content.as_str())
                 .ok_or_else(|| VlmError::Malformed("empty choices".to_owned()))?;
-            let parsed: VlmResponse =
-                serde_json::from_str(content).map_err(|e| VlmError::Malformed(e.to_string()))?;
-            parsed.validate().map_err(VlmError::Schema)?;
+            let parsed: VlmResponse = match serde_json::from_str(content) {
+                Ok(parsed) => parsed,
+                Err(e) => {
+                    warn!(
+                        "VLM returned malformed JSON ({}): {}",
+                        e,
+                        content.chars().take(240).collect::<String>()
+                    );
+                    return Err(VlmError::Malformed(e.to_string()));
+                }
+            };
+            if let Err(e) = parsed.validate() {
+                warn!("VLM response failed schema validation: {e}");
+                return Err(VlmError::Schema(e));
+            }
             Ok(parsed)
         })
     }
@@ -310,25 +354,30 @@ impl<B: VlmBackend> VlmWorker<B> {
     /// not stop System 1: results are simply dropped.
     pub async fn run(mut self) {
         while let Some(request) = self.receiver.recv().await {
-            let (kind, response) = if request.spatial.escalation_score()
-                < self.config.escalation_threshold
-            {
-                (OutcomeKind::Bypassed, None)
-            } else {
-                let budget = Duration::from_millis(self.config.timeout_ms);
-                match tokio::time::timeout(budget, self.backend.propose(&request)).await {
-                    Ok(Ok(response)) => (OutcomeKind::Accepted, Some(response)),
-                    Ok(Err(VlmError::Malformed(_))) | Ok(Err(VlmError::Schema(_))) => {
-                        (OutcomeKind::FallbackMalformed, None)
-                    }
-                    Ok(Err(VlmError::Unavailable)) | Ok(Err(VlmError::Transport(_))) => {
-                        (OutcomeKind::FallbackUnreachable, None)
-                    }
-                    Ok(Err(VlmError::Timeout(_))) | Err(_) => (OutcomeKind::FallbackTimeout, None),
-                }
-            };
+            let (kind, response, latency_ms) =
+                if request.spatial.escalation_score() < self.config.escalation_threshold {
+                    (OutcomeKind::Bypassed, None, 0.0_f32)
+                } else {
+                    let started = Instant::now();
+                    let budget = Duration::from_millis(self.config.timeout_ms);
+                    let (kind, response) =
+                        match tokio::time::timeout(budget, self.backend.propose(&request)).await {
+                            Ok(Ok(response)) => (OutcomeKind::Accepted, Some(response)),
+                            Ok(Err(VlmError::Malformed(_))) | Ok(Err(VlmError::Schema(_))) => {
+                                (OutcomeKind::FallbackMalformed, None)
+                            }
+                            Ok(Err(VlmError::Unavailable)) | Ok(Err(VlmError::Transport(_))) => {
+                                (OutcomeKind::FallbackUnreachable, None)
+                            }
+                            Ok(Err(VlmError::Timeout(_))) | Err(_) => {
+                                (OutcomeKind::FallbackTimeout, None)
+                            }
+                        };
+                    let elapsed_ms = (started.elapsed().as_secs_f64() * 1000.0) as f32;
+                    (kind, response, elapsed_ms)
+                };
             self.stats.record(kind);
-            let proposal = build_proposal(&request, response, &self.config.model, kind);
+            let proposal = build_proposal(&request, response, &self.config.model, kind, latency_ms);
             let result = VlmResult { proposal, kind, spatial: request.spatial };
             if self.sender.send(result).await.is_err() {
                 break;
@@ -376,6 +425,7 @@ fn build_proposal(
     response: Option<VlmResponse>,
     model: &str,
     kind: OutcomeKind,
+    latency_ms: f32,
 ) -> VlmProposal {
     match response {
         Some(response) => VlmProposal {
@@ -388,7 +438,7 @@ fn build_proposal(
                 aegis_proto::to_hex(&request.frame_hash[0..4])
             ),
             model: model.to_owned(),
-            latency_ms: 0.0,
+            latency_ms,
             response,
         },
         None if kind == OutcomeKind::Bypassed => {

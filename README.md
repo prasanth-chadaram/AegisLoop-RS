@@ -136,10 +136,14 @@ All numbers below were **actually measured** on this host with `--release`; none
 | **Simulated** System 1 (synthetic depth) | `bench --frames 2000 --warmup 100` | 2000 | 0.023 ms | 0.042 ms | 0.067 ms | 11,483 FPS | 99.90% | 5.8 MiB |
 | **Simulated** full stack (Zenoh + SQLite + mock VLM) | `sim --frames 90 --interval-ms 5` | 90 | 0.034 ms | 0.097 ms | 0.178 ms | interval-limited | 96.67% | 13.4 MiB |
 | **Real weights** Depth Anything V2 Small int8 ONNX, CPU | `bench --frames 200 --warmup 20 --real-model` | 200 | 14.909 ms | 18.562 ms | 19.896 ms | 59.6 FPS | 100.00% | 79.1 MiB |
+| **Real VLM, production SLA** SmolVLM2 Q4_K_M via llama-server | `sim --frames 12 --real-vlm` (1500 ms SLA) | 12 | 0.049 ms | 0.147 ms | 0.147 ms | interval-limited | 75.00% | 20.2 MiB |
+| **Real VLM, relaxed SLA** same endpoint, 8000 ms timeout | `sim --frames 12 --real-vlm --timeout-ms 8000` | 12 | 0.061 ms | 0.189 ms | 0.189 ms | interval-limited | 75.00% | 20.1 MiB |
 
-Full-stack simulation also measured **1.00 ms** from intrusion frame to latched `HaltCell` publication (budget: <50 ms), wrote **90** audit entries, chain verification passed, and replay produced **0 mismatches** (88 approved, 2 vetoed). The simulated paths use the deterministic depth estimator and a mock VLM; they do **not** imply real-model accuracy. The real-weight row is an ONNX inference benchmark only — the VLM endpoint was not used for that measurement.
+Full-stack simulation also measured **1.00 ms** from intrusion frame to latched `HaltCell` publication (budget: <50 ms), wrote **90** audit entries, chain verification passed, and replay produced **0 mismatches** (88 approved, 2 vetoed). The simulated paths use the deterministic depth estimator and a mock VLM; they do **not** imply real-model accuracy.
 
-> Real ONNX input is preprocessed to 64×64 NCHW with two intra-op threads. Depth Anything V2 emits *relative* depth; `depth_scale_mm` must be calibrated per camera before the real backend can drive proximity thresholds in production. `allow_scene_hints` is forced off for real-model runs so untrusted frame tags can never fabricate an intrusion.
+At the **1500 ms production SLA** the real 256M VLM could not answer in time on this CPU: both escalations timed out and were replaced by the deterministic safe fallback (0 accepted / 2 fallbacks) while System 1 continued at ~0.05 ms. With the timeout relaxed to 8000 ms, both responses were accepted with measured VLM latencies of **2385 ms** and **2568 ms** (2 accepted / 0 fallbacks), and the resulting ledger still verified and replayed with 0 mismatches. This is the intended behaviour: semantic recovery is best-effort, the safety envelope is not.
+
+> Real ONNX input is preprocessed to 64×64 NCHW with two intra-op threads. Depth Anything V2 emits *relative* depth; the real backend applies `mm = depth_offset_mm + d * depth_gain_mm` (default `300 + 1500*d` in `--real-model` runs) and must be calibrated per camera before driving proximity thresholds in production. `allow_scene_hints` is forced off for real-model runs so untrusted frame tags can never fabricate an intrusion.
 
 ---
 
@@ -148,7 +152,7 @@ Full-stack simulation also measured **1.00 ms** from intrusion frame to latched 
 ```text
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace          # 43 tests: 39 unit + 4 cross-crate integration
+cargo test --workspace          # 44 tests: 40 unit + 4 cross-crate integration
 ```
 
 Tests cover: geofence veto, human-proximity override, watchdog expiry, latency SLA, rate/jerk clamping, E-stop latching, NaN rejection, VLM timeout/malformed fallback, strict JSON schema, hash-chain tamper detection, and deterministic replay. No test needs model weights, network, or a Zenoh broker.

@@ -243,6 +243,7 @@ pub fn replay_ledger(path: &Path, config: SafetyConfig) -> Result<ReplayReport, 
     )?;
     let rows = stmt.query_map([], row_to_event)?;
     let mut engine = SafetyEngine::new(config);
+    let mut last_decision_ns = 0_u64;
     let mut report = ReplayReport {
         entries: 0,
         mismatches: 0,
@@ -255,9 +256,19 @@ pub fn replay_ledger(path: &Path, config: SafetyConfig) -> Result<ReplayReport, 
     for row in rows {
         let event = row?;
         let rec = event.record;
+        // A new process restarts its monotonic clock and frame sequence. Each
+        // recorded session therefore starts from a fresh gate, exactly as it
+        // did when originally evaluated.
+        let decision_ns = rec.safety_decision.evaluated_ns;
+        // Decision time comes from a process-local monotonic clock: a
+        // backwards jump marks a new run without confusing out-of-order
+        // sensor sequences inside one run.
+        if decision_ns < last_decision_ns {
+            engine = SafetyEngine::new(config);
+        }
+        last_decision_ns = decision_ns.max(last_decision_ns);
         // The recorded decision timestamp is the authoritative evaluation
         // time. Reusing it makes watchdog timing and `source_ns` bit-identical.
-        let decision_ns = rec.safety_decision.evaluated_ns;
         engine.observe_spatial(&rec.spatial_state, decision_ns.max(rec.spatial_state.timestamp_ns));
         let proposal = rec.vlm_proposal.clone().unwrap_or_else(|| {
             VlmProposal::synthetic_continue(rec.spatial_state.seq, rec.spatial_state.timestamp_ns)
@@ -454,6 +465,24 @@ mod tests {
         assert_eq!(report.entries, 3);
         assert_eq!(report.vetoed, 1);
         assert!(report.clamped >= 1);
+    }
+
+    #[test]
+    fn multi_session_replay_resets_gate_at_new_process() {
+        let db = TempDb::new();
+        {
+            let mut recorder = Recorder::open(&db.path).expect("open");
+            recorder.append(&record(1, VlmAction::Continue, false), 1).expect("session 1");
+            recorder.append(&record(2, VlmAction::Continue, true), 2).expect("session 1 intrusion");
+        }
+        {
+            let mut recorder = Recorder::open(&db.path).expect("reopen");
+            // New process: sequence resets and timestamps move backwards.
+            recorder.append(&record(1, VlmAction::Continue, false), 1).expect("session 2");
+        }
+        let report = replay_ledger(&db.path, SafetyConfig::default()).expect("replay");
+        assert!(report.deterministic, "mismatches: {:?}", report.first_mismatch);
+        assert_eq!(report.entries, 3);
     }
 
     #[test]

@@ -140,6 +140,8 @@ async fn main() {
             let mut real_path = None;
             if real_model {
                 spatial.allow_scene_hints = false;
+                spatial.depth_offset_mm = 300.0;
+                spatial.depth_gain_mm = 1500.0;
                 let dir = resolve_model_dir(model_dir.as_deref());
                 let path = dir.join("depth-anything-v2-small.onnx");
                 if !path.is_file() {
@@ -261,6 +263,7 @@ fn print_runtime_report(report: &aegis_sim::RuntimeReport, label: &str) {
     println!("frames processed      : {}", report.frames);
     println!("spatial states        : {}", report.spatial_states);
     println!("VLM results           : {}", report.vlm_results);
+    println!("VLM accepted/fallback : {}/{}", report.vlm_accepted, report.vlm_fallbacks);
     println!("VLM bypass rate       : {:.2}%", report.vlm_bypass_rate * 100.0);
     println!("safety vetoes         : {}", report.vetoes);
     println!("safety clamps         : {}", report.clamps);
@@ -357,6 +360,8 @@ fn build_bench_pipeline(
     {
         let mut cfg = cfg.clone();
         cfg.allow_scene_hints = false;
+        cfg.depth_offset_mm = 300.0;
+        cfg.depth_gain_mm = 1500.0;
         let dir = resolve_model_dir(model_dir);
         let path = dir.join("depth-anything-v2-small.onnx");
         if !path.is_file() {
