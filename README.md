@@ -148,7 +148,7 @@ Full-stack simulation also measured **1.00 ms** from intrusion frame to latched 
 ```text
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace          # 42 tests: 38 unit + 4 cross-crate integration
+cargo test --workspace          # 43 tests: 39 unit + 4 cross-crate integration
 ```
 
 Tests cover: geofence veto, human-proximity override, watchdog expiry, latency SLA, rate/jerk clamping, E-stop latching, NaN rejection, VLM timeout/malformed fallback, strict JSON schema, hash-chain tamper detection, and deterministic replay. No test needs model weights, network, or a Zenoh broker.

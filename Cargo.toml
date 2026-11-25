@@ -29,6 +29,8 @@ zenoh = "1.10"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 clap = { version = "4", features = ["derive"] }
+base64 = "0.22"
+png = "0.18"
 ort = { version = "2.0.0-rc.15", default-features = false, features = ["std", "ndarray", "tracing", "download-binaries", "tls-rustls", "copy-dylibs", "api-31"] }
 
 [profile.release]

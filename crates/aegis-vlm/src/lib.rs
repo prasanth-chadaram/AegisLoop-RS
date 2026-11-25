@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
+use tracing::warn;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -58,6 +59,10 @@ pub struct VlmRequest {
     pub timestamp_ns: u64,
     pub frame_hash: [u8; 32],
     pub spatial: SpatialState,
+    /// Raw RGB pixels, sent to the VLM as a data-URL PNG when available.
+    pub image_rgb: Option<Vec<u8>>,
+    pub image_width: u32,
+    pub image_height: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -219,6 +224,33 @@ impl VlmBackend for HttpVlmBackend {
                 serde_json::to_string(&request.spatial)
                     .map_err(|e| VlmError::Malformed(e.to_string()))?
             );
+            let mut user_content = serde_json::json!([
+                {"type": "text", "text": prompt}
+            ]);
+            if let (Some(pixels), w, h) =
+                (request.image_rgb.as_ref(), request.image_width, request.image_height)
+            {
+                if w > 0 && h > 0 && !pixels.is_empty() {
+                    match encode_png(pixels, w, h) {
+                        Ok(png_bytes) => {
+                            let url = format!(
+                                "data:image/png;base64,{}",
+                                base64::Engine::encode(
+                                    &base64::engine::general_purpose::STANDARD,
+                                    &png_bytes
+                                )
+                            );
+                            if let Some(array) = user_content.as_array_mut() {
+                                array.push(serde_json::json!({
+                                    "type": "image_url",
+                                    "image_url": {"url": url}
+                                }));
+                            }
+                        }
+                        Err(e) => warn!("PNG encoding failed: {e}"),
+                    }
+                }
+            }
             let body = serde_json::json!({
                 "model": self.config.model,
                 "temperature": 0.0,
@@ -226,7 +258,7 @@ impl VlmBackend for HttpVlmBackend {
                 "response_format": {"type": "json_object"},
                 "messages": [
                     {"role": "system", "content": "Output strict JSON only. No markdown."},
-                    {"role": "user", "content": prompt}
+                    {"role": "user", "content": user_content}
                 ]
             });
             let response = self
@@ -305,6 +337,17 @@ impl<B: VlmBackend> VlmWorker<B> {
     }
 }
 
+fn encode_png(pixels: &[u8], width: u32, height: u32) -> Result<Vec<u8>, String> {
+    let mut out = Vec::with_capacity(pixels.len().saturating_add(128));
+    let mut encoder = png::Encoder::new(&mut out, width, height);
+    encoder.set_color(png::ColorType::Rgb);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header().map_err(|e| e.to_string())?;
+    writer.write_image_data(pixels).map_err(|e| e.to_string())?;
+    drop(writer);
+    Ok(out)
+}
+
 pub fn safe_fallback(spatial: &SpatialState, seq: u64) -> VlmProposal {
     let action = if spatial.human_intrusion || spatial.obstacle_intrusion {
         VlmAction::HaltCell {
@@ -379,7 +422,15 @@ mod tests {
             engine: "test".to_owned(),
         };
         let meta = FrameMeta::new(1, 1_000_000_000, "cam-0", 8, 8, &[0; 192], "nominal");
-        VlmRequest { seq: 1, timestamp_ns: meta.monotonic_ns, frame_hash: meta.frame_hash, spatial }
+        VlmRequest {
+            seq: 1,
+            timestamp_ns: meta.monotonic_ns,
+            frame_hash: meta.frame_hash,
+            spatial,
+            image_rgb: None,
+            image_width: 0,
+            image_height: 0,
+        }
     }
 
     async fn run_one<B: VlmBackend + Send + 'static>(
@@ -451,6 +502,13 @@ mod tests {
         .await;
         assert_eq!(result.kind, OutcomeKind::FallbackMalformed);
         assert!(matches!(result.proposal.response.action, VlmAction::HaltCell { .. }));
+    }
+
+    #[test]
+    fn png_encoder_accepts_rgb_frames() {
+        let pixels = vec![90_u8; 8 * 8 * 3];
+        let encoded = encode_png(&pixels, 8, 8).expect("png");
+        assert!(encoded.starts_with(&[0x89, b'P', b'N', b'G']));
     }
 
     #[test]

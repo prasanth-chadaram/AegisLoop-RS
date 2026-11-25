@@ -296,6 +296,9 @@ pub async fn run<B: VlmBackend + Send + 'static>(
                         timestamp_ns: frame.meta.monotonic_ns,
                         frame_hash: frame.meta.frame_hash,
                         spatial,
+                        image_rgb: Some(frame.pixels.clone()),
+                        image_width: frame.meta.width,
+                        image_height: frame.meta.height,
                     };
                     let accepted = match vlm_tx.as_ref() {
                         Some(tx) => tx.send(request).await.is_ok(),

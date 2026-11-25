@@ -102,6 +102,9 @@ fn timeout_fallback_is_gated_before_actuation() {
         timestamp_ns: frame.meta.monotonic_ns,
         frame_hash: frame.meta.frame_hash,
         spatial: spatial.clone(),
+        image_rgb: Some(frame.pixels.clone()),
+        image_width: frame.meta.width,
+        image_height: frame.meta.height,
     };
     let backend = MockBackend::failing(VlmError::Timeout(1500));
     future::block_on(async move {

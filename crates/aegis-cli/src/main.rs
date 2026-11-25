@@ -409,6 +409,9 @@ mod tests {
                 timestamp_ns: frame.meta.monotonic_ns,
                 frame_hash: frame.meta.frame_hash,
                 spatial,
+                image_rgb: Some(frame.pixels.clone()),
+                image_width: frame.meta.width,
+                image_height: frame.meta.height,
             };
             let response = ScenarioMockBackend.propose(&request).await.expect("mock response");
             levels.push(response.action);
