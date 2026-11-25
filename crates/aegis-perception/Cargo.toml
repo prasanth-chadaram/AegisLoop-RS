@@ -1,0 +1,18 @@
+[package]
+name = "aegis-perception"
+description = "System 1 deterministic spatial perception loop with optional ONNX backend"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+onnx = ["dep:ort", "dep:ndarray"]
+
+[dependencies]
+aegis-proto.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+ort = { workspace = true, optional = true }
+ndarray = { version = "0.17", optional = true }

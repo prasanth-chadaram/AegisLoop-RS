@@ -1,0 +1,14 @@
+[package]
+name = "aegis-recorder"
+description = "Append-only SQLite WAL flight recorder with SHA-256 hash chain and deterministic replay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+aegis-proto.workspace = true
+aegis-safety.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rusqlite.workspace = true
+thiserror.workspace = true

@@ -1,0 +1,29 @@
+[package]
+name = "aegis-cli"
+description = "Unified AegisLoop-RS binary: run, sim, bench, verify-audit, replay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "aegis-cli"
+path = "src/main.rs"
+
+[features]
+default = []
+onnx = ["aegis-perception/onnx", "aegis-sim/onnx"]
+
+[dev-dependencies]
+rusqlite.workspace = true
+
+[dependencies]
+aegis-proto.workspace = true
+aegis-perception.workspace = true
+aegis-vlm.workspace = true
+aegis-safety.workspace = true
+aegis-recorder.workspace = true
+aegis-sim.workspace = true
+clap.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing-subscriber.workspace = true
