@@ -3,16 +3,17 @@
 //! Frames are published on real Zenoh topics. The same code path handles
 //! generated simulator frames and externally produced camera frames.
 
+pub mod rss;
 pub mod scenarios;
 
 use aegis_perception::{peak_rss_bytes, SpatialConfig, SpatialPipeline};
 use aegis_proto::{
-    AuditEvent, AuditRecord, FrameMeta, RgbFrame, SpatialState, VlmAction, VlmProposal,
-    VlmResponse, TOPIC_ACTUATOR_CMD, TOPIC_AUDIT_EVENT, TOPIC_CAM_RGB, TOPIC_SPATIAL,
+    AuditEvent, AuditRecord, Disposition, FrameMeta, RgbFrame, SpatialState, VlmAction,
+    VlmProposal, VlmResponse, TOPIC_ACTUATOR_CMD, TOPIC_AUDIT_EVENT, TOPIC_CAM_RGB, TOPIC_SPATIAL,
     TOPIC_VLM_INTENT,
 };
 use aegis_recorder::{verify_ledger, Recorder, VerifyReport};
-use aegis_safety::{SafetyConfig, SafetyEngine};
+use aegis_safety::{DecidedCommand, SafetyConfig, SafetyEngine};
 use aegis_vlm::{
     OutcomeKind, SharedVlmStats, VlmBackend, VlmConfig, VlmRequest, VlmResult, VlmWorker,
 };
@@ -82,6 +83,12 @@ pub struct RuntimeConfig {
     pub spatial: SpatialConfig,
     /// Optional real ONNX weights path. `None` keeps the offline estimator.
     pub real_model: Option<PathBuf>,
+    /// Print every safety verdict with rule IDs (benchmarks / incident review).
+    pub log_verdicts: bool,
+    /// Benchmark-only: keep deterministic scene tags as anomaly hints while
+    /// using real ONNX weights, so System 2 escalations can be exercised.
+    /// Never enable this in a production cell.
+    pub benchmark_scene_hints: bool,
 }
 
 impl Default for RuntimeConfig {
@@ -99,6 +106,8 @@ impl Default for RuntimeConfig {
             vlm: VlmConfig::default(),
             spatial: SpatialConfig::default(),
             real_model: None,
+            log_verdicts: false,
+            benchmark_scene_hints: false,
         }
     }
 }
@@ -111,6 +120,7 @@ pub struct RuntimeReport {
     pub vlm_accepted: u64,
     pub vlm_fallbacks: u64,
     pub bypassed: u64,
+    pub approved: u64,
     pub vetoes: u64,
     pub clamps: u64,
     pub drops: u64,
@@ -119,7 +129,13 @@ pub struct RuntimeReport {
     pub p50_ms: f32,
     pub p95_ms: f32,
     pub p99_ms: f32,
+    /// Rust process peak RSS (VmHWM of this process).
     pub peak_rss_mib: f64,
+    pub rust_process_peak_rss_mib: f64,
+    /// Peak VmHWM observed for any llama-server process during this run.
+    pub llama_server_peak_rss_mib: f64,
+    /// Peak of sampled (Rust VmRSS + llama-server VmRSS) during this run.
+    pub combined_peak_rss_mib: f64,
     pub audit_entries: u64,
     pub audit_valid: bool,
 }
@@ -239,6 +255,8 @@ pub async fn run<B: VlmBackend + Send + 'static>(
     let mut frames = 0_u64;
     let mut pending_vlm = 0_u64;
     let mut stop = false;
+    let mut combined_peak_bytes = 0_u64;
+    let mut llama_hwm_bytes = 0_u64;
     loop {
         if stop && pending_vlm == 0 {
             break;
@@ -285,8 +303,8 @@ pub async fn run<B: VlmBackend + Send + 'static>(
                     publish(&intent_pub, &proposal).await?;
                     publish(&cmd_pub, &decided.command).await?;
                     record(&mut recorder, &audit_pub, &frame, &spatial, Some(&proposal), &decided, ts).await?;
-                    report.vetoes = report.vetoes.saturating_add(u64::from(decided.command.vetoed));
-                    report.clamps = report.clamps.saturating_add(u64::from(decided.command.clamped));
+                    tally_decision(&mut report, &decided, config.log_verdicts);
+                    observe_rss(&mut combined_peak_bytes, &mut llama_hwm_bytes);
                     if decided.command.vetoed {
                         let latency = ts.saturating_sub(spatial.timestamp_ns) as f32 / 1_000_000.0;
                         report.estop_latency_ms = Some(latency);
@@ -332,6 +350,8 @@ pub async fn run<B: VlmBackend + Send + 'static>(
                     publish(&cmd_pub, &decided.command).await?;
                     record(&mut recorder, &audit_pub, &frame, &spatial, None, &decided, ts).await?;
                     report.bypassed = report.bypassed.saturating_add(1);
+                    tally_decision(&mut report, &decided, config.log_verdicts);
+                    observe_rss(&mut combined_peak_bytes, &mut llama_hwm_bytes);
                 }
 
                 if generator && frames >= total {
@@ -363,8 +383,8 @@ pub async fn run<B: VlmBackend + Send + 'static>(
                     decision_ns,
                 )
                 .await?;
-                report.vetoes = report.vetoes.saturating_add(u64::from(decided.command.vetoed));
-                report.clamps = report.clamps.saturating_add(u64::from(decided.command.clamped));
+                tally_decision(&mut report, &decided, config.log_verdicts);
+                observe_rss(&mut combined_peak_bytes, &mut llama_hwm_bytes);
             }
         }
     }
@@ -382,7 +402,17 @@ pub async fn run<B: VlmBackend + Send + 'static>(
     report.p50_ms = summary.p50_ms;
     report.p95_ms = summary.p95_ms;
     report.p99_ms = summary.p99_ms;
-    report.peak_rss_mib = peak_rss_bytes().unwrap_or(0) as f64 / (1024.0 * 1024.0);
+    let final_sample = rss::snapshot();
+    let rust_peak = peak_rss_bytes()
+        .unwrap_or(0)
+        .max(final_sample.rust_hwm_bytes)
+        .max(final_sample.rust_rss_bytes);
+    llama_hwm_bytes = llama_hwm_bytes.max(final_sample.llama_hwm_bytes);
+    combined_peak_bytes = combined_peak_bytes.max(rust_peak.saturating_add(llama_hwm_bytes));
+    report.peak_rss_mib = rss::mib(rust_peak);
+    report.rust_process_peak_rss_mib = report.peak_rss_mib;
+    report.llama_server_peak_rss_mib = rss::mib(llama_hwm_bytes);
+    report.combined_peak_rss_mib = rss::mib(combined_peak_bytes);
     report.vlm_bypass_rate = if frames == 0 { 0.0 } else { report.bypassed as f64 / frames as f64 };
     report.audit_entries = recorder.len();
     let verification: VerifyReport = verify_ledger(&config.database)?;
@@ -429,6 +459,33 @@ async fn record(
     Ok(event)
 }
 
+fn tally_decision(report: &mut RuntimeReport, decided: &DecidedCommand, log: bool) {
+    match decided.decision.disposition {
+        Disposition::Approved => report.approved = report.approved.saturating_add(1),
+        Disposition::Clamped => report.clamps = report.clamps.saturating_add(1),
+        Disposition::Vetoed => report.vetoes = report.vetoes.saturating_add(1),
+    }
+    if log {
+        let rules = decided.decision.rules.iter().map(|r| r.as_str()).collect::<Vec<_>>().join(",");
+        let verdict = match decided.decision.disposition {
+            Disposition::Approved => "APPROVED",
+            Disposition::Clamped => "CLAMPED",
+            Disposition::Vetoed => "VETOED",
+        };
+        println!(
+            "[aegis] verdict seq={} {verdict} rules=[{rules}] cmd={:?}",
+            decided.command.seq, decided.command.action
+        );
+    }
+}
+
+fn observe_rss(combined_peak_bytes: &mut u64, llama_hwm_bytes: &mut u64) {
+    let sample = rss::snapshot();
+    *combined_peak_bytes =
+        (*combined_peak_bytes).max(sample.rust_rss_bytes.saturating_add(sample.llama_rss_bytes));
+    *llama_hwm_bytes = (*llama_hwm_bytes).max(sample.llama_hwm_bytes);
+}
+
 fn print_dashboard(
     frames: u64,
     pipeline: &SpatialPipeline,
@@ -437,14 +494,16 @@ fn print_dashboard(
 ) {
     let summary = pipeline.stats().summary();
     let counters = vlm.snapshot();
-    let rss = peak_rss_bytes().unwrap_or(0) as f64 / (1024.0 * 1024.0);
+    let sample = rss::snapshot();
+    let rss = rss::mib(sample.rust_hwm_bytes);
+    let llama_rss = rss::mib(sample.llama_rss_bytes);
     let bypass = if frames == 0 {
         0.0
     } else {
         frames.saturating_sub(counters.requests) as f64 / frames as f64 * 100.0
     };
     println!(
-        "[aegis] frames={frames:5} s1 p50/p95/p99={:.2}/{:.2}/{:.2}ms vlm_bypass={bypass:5.1}% vetoes={} clamps={} rss={rss:6.1}MiB mode={}",
+        "[aegis] frames={frames:5} s1 p50/p95/p99={:.2}/{:.2}/{:.2}ms vlm_bypass={bypass:5.1}% vetoes={} clamps={} rss={rss:6.1}MiB llama={llama_rss:6.1}MiB mode={}",
         summary.p50_ms,
         summary.p95_ms,
         summary.p99_ms,

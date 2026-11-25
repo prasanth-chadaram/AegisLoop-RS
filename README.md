@@ -129,22 +129,24 @@ llama-server -m "$AEGIS_MODEL_DIR/SmolVLM2-256M-Video-Instruct-Q4_K_M.gguf" \
 
 All numbers below were **actually measured** on this host with `--release`; none are estimated or fabricated.
 
-**Host:** Pop!_OS Linux, Intel Core i3-1005G1 (2C/4T), 8 GB RAM, CPU-only. Peak RSS read from `/proc/self/status` `VmHWM`.
+**Host:** Pop!_OS Linux, Intel Core i3-1005G1 (2C/4T), 8 GB RAM, CPU-only. `Rust Process Peak RSS` is this process's `/proc/self/status` `VmHWM`; `Combined Peak RSS (Rust + llama-server)` is the peak sampled sum of both processes' `VmRSS`, with llama-server discovered through `/proc/<pid>/comm` (its `VmHWM` is also tracked).
 
-| Scenario | Command | Frames | p50 | p95 | p99 | Throughput | VLM bypass | Peak RSS |
-| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| **Simulated** System 1 (synthetic depth) | `bench --frames 2000 --warmup 100` | 2000 | 0.023 ms | 0.042 ms | 0.067 ms | 11,483 FPS | 99.90% | 5.8 MiB |
-| **Simulated** full stack (Zenoh + SQLite + mock VLM) | `sim --frames 90 --interval-ms 5` | 90 | 0.034 ms | 0.097 ms | 0.178 ms | interval-limited | 96.67% | 13.4 MiB |
-| **Real weights** Depth Anything V2 Small int8 ONNX, CPU | `bench --frames 200 --warmup 20 --real-model` | 200 | 14.909 ms | 18.562 ms | 19.896 ms | 59.6 FPS | 100.00% | 79.1 MiB |
-| **Real VLM, production SLA** SmolVLM2 Q4_K_M via llama-server | `sim --frames 12 --real-vlm` (1500 ms SLA) | 12 | 0.049 ms | 0.147 ms | 0.147 ms | interval-limited | 75.00% | 20.2 MiB |
-| **Real VLM, relaxed SLA** same endpoint, 8000 ms timeout | `sim --frames 12 --real-vlm --timeout-ms 8000` | 12 | 0.061 ms | 0.189 ms | 0.189 ms | interval-limited | 75.00% | 20.1 MiB |
-| **End-to-end real weights** ONNX depth + HTTP SmolVLM2 | `sim --frames 10 --real-model --real-vlm --timeout-ms 8000` | 10 | 40.696 ms | 62.092 ms | 62.092 ms | interval-limited | 100.00% | 90.7 MiB |
+| Scenario | Command | Frames | p50 | p95 | p99 | Throughput | VLM bypass | Rust Process Peak RSS | Combined Peak RSS (Rust + llama-server) |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| **Simulated** System 1 (synthetic depth) | `bench --frames 2000 --warmup 100` | 2000 | 0.028 ms | 0.049 ms | 0.070 ms | 10,270.9 FPS | 99.90% | 10.3 MiB | 10.3 MiB |
+| **Simulated** full stack (Zenoh + SQLite + mock VLM) | `sim --frames 90 --interval-ms 5` | 90 | 0.034 ms | 0.069 ms | 0.165 ms | interval-limited | 96.67% | 18.9 MiB | 18.9 MiB |
+| **Real weights** Depth Anything V2 Small int8 ONNX, CPU | `bench --frames 200 --warmup 20 --real-model` | 200 | 18.123 ms | 21.472 ms | 22.975 ms | 50.3 FPS | 100.00% | 79.8 MiB | 79.8 MiB |
+| **Real VLM, production SLA** SmolVLM2 Q4_K_M via llama-server | `sim --frames 12 --real-vlm` (1500 ms SLA) | 12 | 0.061 ms | 0.090 ms | 0.090 ms | interval-limited | 75.00% | 20.4 MiB | 558.8 MiB |
+| **Real VLM, relaxed SLA** same endpoint, 8000 ms timeout | `sim --frames 12 --real-vlm --timeout-ms 8000` | 12 | 0.111 ms | 0.301 ms | 0.301 ms | interval-limited | 75.00% | 20.6 MiB | 589.6 MiB |
+| **End-to-end real weights, forced escalations** ONNX + SmolVLM2 | `sim --frames 10 --real-model --real-vlm --benchmark-scene-hints --log-verdicts --timeout-ms 8000` | 10 | 22.701 ms | 27.938 ms | 27.938 ms | interval-limited | 80.00% | 89.1 MiB | 595.5 MiB |
 
-Full-stack simulation also measured **1.00 ms** from intrusion frame to latched `HaltCell` publication (budget: <50 ms), wrote **90** audit entries, chain verification passed, and replay produced **0 mismatches** (88 approved, 2 vetoed). The simulated paths use the deterministic depth estimator and a mock VLM; they do **not** imply real-model accuracy.
+Full-stack simulation wrote **90** audit entries, chain verification passed, and replay produced **0 mismatches** (88 approved, 2 vetoed), with intrusion-to-halt measured at 1–25 ms depending on Zenoh delivery timing (budget: 50 ms). The simulated paths use the deterministic depth estimator and a mock VLM; they do **not** imply real-model accuracy.
 
-In the end-to-end real-weight run, calibrated real depth saw no anomaly in the synthetic scene tags, so System 2 was correctly bypassed on 100% of frames; System 1 latency was higher than the isolated ONNX bench because `llama-server` was competing for the same two CPU cores. The ledger verified and replayed with 0 mismatches (10 approved).
+The standalone-ONNX versus end-to-end latency gap (14.9 ms vs 40.7 ms in the first run; 18.1 ms vs 22.7 ms in the final forced-escalation run) comes from Zenoh transport plus CPU thread contention between ONNX Runtime and `llama-server` on the 2C/4T i3.
 
-At the **1500 ms production SLA** the real 256M VLM could not answer in time on this CPU: both escalations timed out and were replaced by the deterministic safe fallback (0 accepted / 2 fallbacks) while System 1 continued at ~0.05 ms. With the timeout relaxed to 8000 ms, both responses were accepted with measured VLM latencies of **2385 ms** and **2568 ms** (2 accepted / 0 fallbacks), and the resulting ledger still verified and replayed with 0 mismatches. This is the intended behaviour: semantic recovery is best-effort, the safety envelope is not.
+The final end-to-end run used the benchmark-only `--benchmark-scene-hints` flag to force **2 real VLM escalations** out of 10 frames (80% bypass, 2/2 responses accepted). Verdicts were logged per frame: **8 APPROVED, 0 CLAMPED, 2 VETOED** (`WD-001` when the slow VLM response outlived the 10-frame burst and its System 1 heartbeat, then `LATCH-001` while the E-stop stayed latched). The audit chain verified and replay was bit-identical (0 mismatches). This hint flag is not a production configuration; production keeps `allow_scene_hints = false` and a 100 ms watchdog.
+
+At the **1500 ms production SLA** the real 256M VLM could not answer in time on this CPU: both escalations timed out and were replaced by the deterministic safe fallback (0 accepted / 2 fallbacks) while System 1 continued at ~0.05 ms. With the timeout relaxed to 8000 ms, both responses were accepted with measured VLM latencies of **5908 ms** and **3352 ms** in the synthetic-depth run, and **498 ms** / **451 ms** with a warm KV cache in the end-to-end run; the resulting ledgers still verified and replayed with 0 mismatches. This is the intended behaviour: semantic recovery is best-effort, the safety envelope is not.
 
 > Real ONNX input is preprocessed to 64×64 NCHW with two intra-op threads. Depth Anything V2 emits *relative* depth; the real backend applies `mm = depth_offset_mm + d * depth_gain_mm` (default `300 + 1500*d` in `--real-model` runs) and must be calibrated per camera before driving proximity thresholds in production. `allow_scene_hints` is forced off for real-model runs so untrusted frame tags can never fabricate an intrusion.
 
@@ -155,7 +157,7 @@ At the **1500 ms production SLA** the real 256M VLM could not answer in time on 
 ```text
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace          # 44 tests: 40 unit + 4 cross-crate integration
+cargo test --workspace          # 46 tests: 42 unit + 4 cross-crate integration
 ```
 
 Tests cover: geofence veto, human-proximity override, watchdog expiry, latency SLA, rate/jerk clamping, E-stop latching, NaN rejection, VLM timeout/malformed fallback, strict JSON schema, hash-chain tamper detection, and deterministic replay. No test needs model weights, network, or a Zenoh broker.

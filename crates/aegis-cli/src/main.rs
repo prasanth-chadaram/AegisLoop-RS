@@ -55,6 +55,12 @@ enum Command {
         model: String,
         #[arg(long, default_value_t = 1500)]
         timeout_ms: u64,
+        /// Log every safety verdict with exact rule IDs.
+        #[arg(long)]
+        log_verdicts: bool,
+        /// Benchmark-only: keep scene hints with real ONNX weights so the VLM path is exercised.
+        #[arg(long)]
+        benchmark_scene_hints: bool,
     },
     /// CPU-only latency benchmark (synthetic or real ONNX weights).
     Bench {
@@ -135,11 +141,13 @@ async fn main() {
             endpoint,
             model,
             timeout_ms,
+            log_verdicts,
+            benchmark_scene_hints,
         } => {
             let mut spatial = SpatialConfig::default();
             let mut real_path = None;
             if real_model {
-                spatial.allow_scene_hints = false;
+                spatial.allow_scene_hints = benchmark_scene_hints;
                 spatial.depth_offset_mm = 300.0;
                 spatial.depth_gain_mm = 1500.0;
                 let dir = resolve_model_dir(model_dir.as_deref());
@@ -163,6 +171,8 @@ async fn main() {
                 dashboard_every,
                 scenarios: aegis_sim::scenarios::default_sequence(frames),
                 real_model: real_path,
+                log_verdicts,
+                benchmark_scene_hints,
                 spatial,
                 vlm: vlm.clone(),
                 ..RuntimeConfig::default()
@@ -265,14 +275,20 @@ fn print_runtime_report(report: &aegis_sim::RuntimeReport, label: &str) {
     println!("VLM results           : {}", report.vlm_results);
     println!("VLM accepted/fallback : {}/{}", report.vlm_accepted, report.vlm_fallbacks);
     println!("VLM bypass rate       : {:.2}%", report.vlm_bypass_rate * 100.0);
-    println!("safety vetoes         : {}", report.vetoes);
-    println!("safety clamps         : {}", report.clamps);
+    println!("safety approved       : {}", report.approved);
+    println!("safety clamped        : {}", report.clamps);
+    println!("safety vetoed         : {}", report.vetoes);
     println!(
         "S1 latency p50/p95/p99: {:.3}/{:.3}/{:.3} ms",
         report.p50_ms, report.p95_ms, report.p99_ms
     );
     println!("E-stop latency        : {:?} ms", report.estop_latency_ms);
-    println!("peak RSS              : {:.1} MiB", report.peak_rss_mib);
+    println!("Rust process peak RSS : {:.1} MiB", report.rust_process_peak_rss_mib);
+    println!("llama-server peak RSS : {:.1} MiB", report.llama_server_peak_rss_mib);
+    println!(
+        "Combined peak RSS     : {:.1} MiB (Rust + llama-server)",
+        report.combined_peak_rss_mib
+    );
     println!(
         "audit entries         : {} (chain valid: {})",
         report.audit_entries, report.audit_valid
@@ -327,7 +343,12 @@ fn bench(frames: u64, warmup: u64, real_model: bool, model_dir: Option<&Path>) {
         (frames.saturating_sub(above_threshold.min(frames))) as f64 / frames as f64 * 100.0
     };
     let fps = if elapsed.as_secs_f64() > 0.0 { frames as f64 / elapsed.as_secs_f64() } else { 0.0 };
-    let rss = peak_rss_bytes().unwrap_or(0) as f64 / (1024.0 * 1024.0);
+    let sample = aegis_sim::rss::snapshot();
+    let rss = aegis_sim::rss::mib(
+        peak_rss_bytes().unwrap_or(0).max(sample.rust_hwm_bytes).max(sample.rust_rss_bytes),
+    );
+    let llama_rss = aegis_sim::rss::mib(sample.llama_hwm_bytes);
+    let combined_rss = rss + llama_rss;
     let label = if real_model {
         "REAL MODEL (Depth Anything V2 Small ONNX, CPU)"
     } else {
@@ -342,10 +363,12 @@ fn bench(frames: u64, warmup: u64, real_model: bool, model_dir: Option<&Path>) {
     println!("latency mean           : {:.3} ms", summary.mean_ms);
     println!("throughput             : {:.1} FPS", fps);
     println!("VLM bypass rate        : {:.2}%", bypass_pct);
-    println!("peak RSS               : {:.1} MiB", rss);
-    println!("engine                 : {}", pipeline.config().engine_name());
+    println!("Rust process peak RSS  : {:.1} MiB", rss);
+    println!("llama-server peak RSS  : {:.1} MiB", llama_rss);
+    println!("Combined peak RSS      : {:.1} MiB", combined_rss);
+    println!("engine                 : {}", pipeline.engine_name());
     println!("model dir              : {}", resolve_model_dir(model_dir).display());
-    println!("budget (<2048 MiB)     : {}", if rss < 2048.0 { "PASS" } else { "FAIL" });
+    println!("budget (<2048 MiB)     : {}", if combined_rss < 2048.0 { "PASS" } else { "FAIL" });
 }
 
 fn build_bench_pipeline(

@@ -49,6 +49,10 @@ impl OnnxDepthEstimator {
 }
 
 impl DepthEstimator for OnnxDepthEstimator {
+    fn name(&self) -> &'static str {
+        "depth-anything-v2-small-onnx"
+    }
+
     fn estimate_into(
         &mut self,
         frame: &RgbFrame,
